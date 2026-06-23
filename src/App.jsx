@@ -126,7 +126,7 @@ export default function App() {
           xrSessionRef.current = session;
           if (xrButtonRef.current) xrButtonRef.current.setSession(session);
           // Hide the skybox once we are in immersive-ar.
-          ctx.skybox.visible = false;
+          if (ctx.skybox) ctx.skybox.visible = false;
           session.addEventListener('end', onSessionEnded);
           renderer.xr.setSession(session);
         })

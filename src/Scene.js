@@ -19,17 +19,8 @@ let _localRefSpace = null;
 export function buildScene() {
   const scene = new THREE.Scene();
 
-  // --- Skybox (inline view only; hidden during immersive-ar) ---
-  const skyGeo = new THREE.SphereGeometry(500, 60, 40);
-  const skyTex = new THREE.TextureLoader().load('media/textures/milky-way-4k.png');
-  skyTex.colorSpace = THREE.SRGBColorSpace;
-  const skyMat = new THREE.MeshBasicMaterial({
-    map: skyTex,
-    side: THREE.BackSide,
-    depthWrite: false,
-  });
-  const skybox = new THREE.Mesh(skyGeo, skyMat);
-  scene.add(skybox);
+  // --- Skybox — disabled, no background rendered ---
+  const skybox = null;
 
   // Ambient light — kept minimal for any lit materials added later.
   const ambient = new THREE.AmbientLight(0xffffff, 0.6);
