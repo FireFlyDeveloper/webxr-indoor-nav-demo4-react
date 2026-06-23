@@ -6,5 +6,7 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 5173,
+    strictPort: true,
+    allowedHosts: ['nav.ffly.site', '.ffly.site', 'localhost', '127.0.0.1'],
   },
 });

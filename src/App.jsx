@@ -2,6 +2,8 @@ import React from 'react';
 import * as THREE from 'three';
 import WebXRButton from './WebXRButton.jsx';
 import { buildScene } from './Scene.js';
+import { WAYPOINTS, findPath, getWaypoint } from './MapData.js';
+import Navigation from './Navigation.jsx';
 
 const QUERY_ARGS = (() => {
   const params = new URLSearchParams(window.location.search);
@@ -25,6 +27,40 @@ export default function App() {
 
   // Mount: set up renderer + scene + XR.
   React.useEffect(() => {
+    // --- Init global nav state ---
+    if (!window.__navState) {
+      window.__navState = {
+        destinationId: null,
+        path: [],
+        currentStep: 0,
+        distance: 0,
+        arrived: false,
+        navigating: false,
+      };
+    }
+
+    // Track user's estimated current waypoint for re-routing.
+    let currentWaypointId = WAYPOINTS[0].id; // start at Lobby
+    let imageTrackingCalibrated = false;
+
+    // --- Navigation callback (called by Navigation.jsx) ---
+    window.__onNavigate = (destId, path) => {
+      const ctx = sceneCtxRef.current;
+      if (!ctx) return;
+
+      if (!path || path.length === 0) {
+        ctx.setNavPath(null);
+        return;
+      }
+      const waypointObjs = path.map((id) => getWaypoint(id)).filter(Boolean);
+      ctx.setNavPath(waypointObjs);
+    };
+
+    // --- Calibration callback (called by Navigation.jsx's "Set Origin" button) ---
+    // Deferred until the next XR frame so we have a valid pose.
+    let pendingCalibrate = false;
+    window.__onCalibrate = () => { pendingCalibrate = true; };
+
     // Optional polyfill (default true), matching the original.
     if (getBool('usePolyfill', true)) {
       import('https://cdn.jsdelivr.net/npm/webxr-polyfill@latest/build/webxr-polyfill.module.js')
@@ -83,7 +119,9 @@ export default function App() {
     const onRequestSession = () => {
       if (!navigator.xr) return;
       navigator.xr
-        .requestSession('immersive-ar', { optionalFeatures: ['local-floor'] })
+        .requestSession('immersive-ar', {
+          optionalFeatures: ['local-floor'],
+        })
         .then((session) => {
           xrSessionRef.current = session;
           if (xrButtonRef.current) xrButtonRef.current.setSession(session);
@@ -107,8 +145,6 @@ export default function App() {
       onRequestSession,
       onEndSession,
       setSession: (s) => {
-        // no-op; the React button reads XR state via props in real use.
-        // (kept for API parity with the original class)
         void s;
       },
     };
@@ -117,8 +153,48 @@ export default function App() {
     // hands us a frame + XR camera when in an immersive session.
     renderer.setAnimationLoop((_t, frame) => {
       ctx.update(0);
+
+      // --- Origin calibration (deferred to frame) ---
+      if (pendingCalibrate && frame) {
+        ctx.calibrateOrigin(frame);
+        pendingCalibrate = false;
+      }
+
+      // --- Navigation update (when in AR and navigating) ---
+      if (frame && window.__navState.navigating && !window.__navState.arrived) {
+        const userPos = ctx.getUserPosition(frame);
+        const path = window.__navState.path;
+        const step = window.__navState.currentStep;
+
+        if (path && step < path.length) {
+          const targetWp = getWaypoint(path[step]);
+          if (targetWp) {
+            const dx = userPos.x - targetWp.x;
+            const dz = userPos.z - targetWp.z;
+            const dist = Math.sqrt(dx * dx + dz * dz);
+            window.__navState.distance = dist;
+
+            // Check if user is within 1m of the current target waypoint.
+            if (dist < 1.0) {
+              const nextStep = step + 1;
+              if (nextStep >= path.length) {
+                // Arrived at final destination!
+                window.__navState.currentStep = nextStep;
+                window.__navState.distance = 0;
+                window.__navState.arrived = true;
+                window.__navState.navigating = false;
+              } else {
+                // Advance to next waypoint.
+                window.__navState.currentStep = nextStep;
+                currentWaypointId = path[nextStep];
+              }
+            }
+          }
+        }
+      }
+
+      // Render
       if (frame) {
-        // XR: let three.js handle pose-derived camera via renderer.xr.
         renderer.render(ctx.scene, renderer.xr.getCamera());
       } else {
         renderer.render(ctx.scene, camera);
@@ -133,17 +209,15 @@ export default function App() {
       if (renderer.domElement && renderer.domElement.parentNode) {
         renderer.domElement.parentNode.removeChild(renderer.domElement);
       }
+      delete window.__onNavigate;
     };
   }, []);
 
   // Bridge the imperative renderer-side handlers into the React button.
-  // We do this by re-rendering with a key once handlers are ready; the
-  // button reads handlers from a ref we keep up to date.
   React.useEffect(() => {
     // Re-bind once after mount in case the order changes.
   }, []);
 
-  // We use a small wrapper that defers to xrButtonRef for the click logic.
   const handleButtonClick = (immersive) => {
     if (immersive) {
       xrButtonRef.current && xrButtonRef.current.onEndSession();
@@ -170,6 +244,7 @@ export default function App() {
         </details>
         <WebXRButtonWithBridge ref={xrButtonRef} onClickBridge={handleButtonClick} />
       </header>
+      <Navigation />
     </>
   );
 }
