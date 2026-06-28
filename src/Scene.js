@@ -9,12 +9,19 @@ let _localRefSpace = null;
  *   - navArrowGroup: holds AR navigation arrows / path tube
  *
  * Exposes:
- *   scene            the THREE.Scene
- *   skybox           the THREE.Mesh for the skybox (toggle .visible)
- *   navArrowGroup    the THREE.Group holding nav visuals
- *   update(dt)       per-frame update hook
- *   setNavPath(wpts) draw (or clear) navigation arrows along a path
+ *   scene              the THREE.Scene
+ *   skybox             the THREE.Mesh for the skybox (toggle .visible)
+ *   navArrowGroup      the THREE.Group holding nav visuals
+ *   update(dt)         per-frame update hook
+ *   setNavPath(wpts)   draw (or clear) navigation arrows along a path
  *   getUserPosition(frame)  returns {x, y, z} from XR viewer pose
+ *   calibrateOrigin(frame)  legacy viewer-pose snapshot calibration
+ *   setReticlePose(matrix)  drive a reticle from the latest hit-test pose
+ *   setReticleVisible(bool) show/hide the reticle
+ *   getReticleMatrix()      return the most recent reticle matrix
+ *   setAnchor(xrAnchor)     pin a WebXR XRAnchor as the scene origin
+ *   updateAnchor(frame, space)  poll the anchor's pose each frame
+ *   clearAnchor()           un-pin the anchor
  */
 export function buildScene() {
   const scene = new THREE.Scene();
@@ -30,17 +37,43 @@ export function buildScene() {
   scene.add(sun);
 
   // --- Navigation arrows group ---
+  // When an XRAnchor is set, navArrowGroup is parented to anchorObject3D
+  // (a THREE.Object3D whose pose is updated each frame from
+  // frame.getPose(xrAnchor.anchorSpace, refSpace)). This means the
+  // navigation visuals stay pinned to the real-world location the
+  // user tapped, even as they walk around.
   const navArrowGroup = new THREE.Group();
   navArrowGroup.name = 'navArrowGroup';
-  scene.add(navArrowGroup);
+  const anchorObject3D = new THREE.Object3D();
+  anchorObject3D.name = 'anchorObject3D';
+  anchorObject3D.add(navArrowGroup);
+  scene.add(anchorObject3D);
 
   // --- Floor grid (visual anchor so arrows don't appear to float) ---
   const gridHelper = new THREE.GridHelper(14, 14, 0x444444, 0x222222);
   gridHelper.position.y = 0.005;
   scene.add(gridHelper);
 
-  // --- Origin calibration ---
-  let originOffset = new THREE.Vector3(); // applied to navArrowGroup
+  // --- Reticle (white ring on a horizontal surface) ---
+  // Driven by the hit-test loop. Visible only when a hit-test result
+  // is available and the user hasn't yet placed an anchor.
+  const reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.12, 0.18, 32).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 })
+  );
+  reticle.matrixAutoUpdate = false;
+  reticle.visible = false;
+  scene.add(reticle);
+
+  // Latest reticle pose (4x4 column-major matrix).
+  let reticleMatrix = null;
+
+  // --- Origin calibration state ---
+  // originOffset is the world-space offset applied to navArrowGroup
+  // when we're using the legacy viewer-pose snapshot (no anchor).
+  let originOffset = new THREE.Vector3();
+  let useAnchor = false;        // true once an XRAnchor is set
+  let activeAnchor = null;      // the raw XRAnchor from the runtime
 
   // ------------------------------------------------------------------
   //  ARROW DRAWING HELPERS
@@ -177,8 +210,13 @@ export function buildScene() {
   // ------------------------------------------------------------------
 
   /**
-   * Returns the user's floor-level position from the XR frame.
-   * Falls back to THREE.Vector3(0,0,0) if no pose is available.
+   * Returns the user's floor-level position. The result is in the
+   * coordinate space of the navigation graph — i.e. relative to the
+   * origin (anchor or snapshot).
+   *
+   * - If an XRAnchor is active, we transform the viewer pose through
+   *   the anchor's inverse so the result is in waypoint-local space.
+   * - Otherwise, we use the legacy snapshot offset.
    */
   function getUserPosition(frame) {
     if (!frame) return new THREE.Vector3(0, 0, 0);
@@ -202,7 +240,16 @@ export function buildScene() {
     if (pose && pose.views && pose.views.length > 0) {
       const view = pose.views[0];
       const pos = view.transform.position;
-      // Return position in waypoint-local space (world pos minus origin offset).
+
+      if (useAnchor && activeAnchor) {
+        // Convert viewer-space position into the anchor's local frame.
+        // The anchor's pose is already applied to anchorObject3D, so
+        // we need the inverse of that pose to subtract it out.
+        const anchorPos = anchorObject3D.position;
+        return new THREE.Vector3(pos.x - anchorPos.x, 0, pos.z - anchorPos.z);
+      }
+
+      // Legacy snapshot path: subtract the captured origin offset.
       return new THREE.Vector3(pos.x - originOffset.x, 0, pos.z - originOffset.z);
     }
 
@@ -210,34 +257,130 @@ export function buildScene() {
   }
 
   // ------------------------------------------------------------------
-  //  ORIGIN CALIBRATION
+  //  ORIGIN CALIBRATION (legacy / fallback)
   // ------------------------------------------------------------------
 
   /**
    * Offsets the navigation group so waypoint 0 (Lobby) aligns with the
    * user's current floor position. Call this when the user is standing
    * at the physical origin point.
+   *
+   * This is the FALLBACK when XRAnchor is not available. With an
+   * anchor, the origin is set via setAnchor() instead.
    */
   function calibrateOrigin(frame) {
     if (!frame) return;
     const userPos = getUserPosition(frame);
-    // First waypoint is at (0,0,0). Shift navArrowGroup so that
-    // (0,0,0) in waypoint space maps to userPos in world space.
     originOffset.copy(userPos);
-    navArrowGroup.position.copy(originOffset);
+    anchorObject3D.position.copy(originOffset);
     // Also shift the grid to stay under the path.
     gridHelper.position.set(userPos.x, 0.005, userPos.z);
+  }
+
+  // ------------------------------------------------------------------
+  //  RETICLE (hit-test visualization)
+  // ------------------------------------------------------------------
+
+  function setReticlePose(matrix) {
+    if (!matrix) return;
+    // Copy into a stable array we can hand back to the caller.
+    reticleMatrix = Array.from(matrix);
+    reticle.matrix.fromArray(matrix);
+    reticle.matrix.decompose(reticle.position, reticle.quaternion, reticle.scale);
+    reticle.visible = true;
+  }
+
+  function setReticleVisible(v) {
+    reticle.visible = !!v;
+    if (!v) reticleMatrix = null;
+  }
+
+  function getReticleMatrix() {
+    return reticleMatrix;
+  }
+
+  // ------------------------------------------------------------------
+  //  ANCHOR (WebXR XRAnchor API)
+  // ------------------------------------------------------------------
+  // The anchor is the runtime-tracked XRAnchor. We attach it to
+  // anchorObject3D by polling its pose every frame via
+  // frame.getPose(xrAnchor.anchorSpace, refSpace). The WebXR runtime
+  // (ARCore, ARKit) does the actual SLAM tracking; we just read the
+  // updated matrix.
+  //
+  // Per the W3C WebXR Anchors Module:
+  //   https://www.w3.org/TR/webxr-anchors-module/
+  // An XRAnchor is a stable, trackable point in space. The pose of
+  // an XRAnchor may change over time as the runtime refines its
+  // understanding of the environment, but its world position is
+  // preserved across frames.
+  // ------------------------------------------------------------------
+
+  function setAnchor(xrAnchor) {
+    activeAnchor = xrAnchor;
+    useAnchor = true;
+    // Clear the snapshot offset — anchor's pose is the new origin.
+    originOffset.set(0, 0, 0);
+    anchorObject3D.position.set(0, 0, 0);
+    anchorObject3D.quaternion.identity();
+    gridHelper.position.set(0, 0.005, 0);
+    // Hide the reticle once the anchor is placed.
+    reticle.visible = false;
+    reticleMatrix = null;
+  }
+
+  function clearAnchor() {
+    activeAnchor = null;
+    useAnchor = false;
+    anchorObject3D.position.set(0, 0, 0);
+    anchorObject3D.quaternion.identity();
+    gridHelper.position.set(0, 0.005, 0);
+  }
+
+  function hasAnchor() {
+    return useAnchor && activeAnchor != null;
+  }
+
+  /**
+   * Per-frame: poll the anchor's current pose and apply it to the
+   * anchorObject3D. This is how the WebXR runtime communicates the
+   * SLAM-refined pose back to us.
+   */
+  function updateAnchor(frame, refSpace) {
+    if (!useAnchor || !activeAnchor || !frame || !refSpace) return;
+    const pose = frame.getPose(activeAnchor.anchorSpace, refSpace);
+    if (!pose) return;
+    anchorObject3D.matrix.fromArray(pose.transform.matrix);
+    anchorObject3D.matrix.decompose(
+      anchorObject3D.position,
+      anchorObject3D.quaternion,
+      anchorObject3D.scale
+    );
+    // Also keep the grid under the anchor for visual continuity.
+    gridHelper.position.set(
+      anchorObject3D.position.x,
+      0.005,
+      anchorObject3D.position.z
+    );
   }
 
   return {
     scene,
     skybox,
     navArrowGroup,
+    anchorObject3D,
     update(_dt) {
       // nothing to do per-frame
     },
     setNavPath,
     getUserPosition,
     calibrateOrigin,
+    setReticlePose,
+    setReticleVisible,
+    getReticleMatrix,
+    setAnchor,
+    clearAnchor,
+    hasAnchor,
+    updateAnchor,
   };
 }
