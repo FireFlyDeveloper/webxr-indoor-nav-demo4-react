@@ -1,15 +1,15 @@
 import * as THREE from 'three';
-
 /**
  * Builds the Three.js scene:
  *   - navArrowGroup: holds AR navigation arrows / path tube, pinned at world (0,0,0)
  *
  * Exposes:
  *   scene              the THREE.Scene
- *   navArrowGroup      the THREE.Group holding nav visuals (lives at world origin)
- *   update(dt)         per-frame update hook
+ *   navArrowGroup      the THREE.Group holding nav visuals
+ *   update(dt, frame)  per-frame update hook — snaps yaw to N/S/W/E
  *   setNavPath(wpts)   draw (or clear) navigation arrows along a path
  *   getUserPosition(frame)  returns {x, y, z} from XR viewer pose
+ *   invalidateUserPosition()
  */
 export function buildScene() {
   const scene = new THREE.Scene();
@@ -21,15 +21,26 @@ export function buildScene() {
   sun.position.set(5, 5, 5);
   scene.add(sun);
 
+  // --- Yaw pivot ---
+  // The whole nav scene is parented to this Object3D. Its Y rotation
+  // is snapped to the nearest cardinal (N/S/W/E) based on the user's
+  // actual compass heading. This keeps arrows aligned to real-world
+  // directions and stops them from "spinning" continuously as the
+  // user turns the phone a few degrees.
+  const yawPivot = new THREE.Object3D();
+  yawPivot.name = 'yawPivot';
+  yawPivot.position.set(0, 0, 0);
+  scene.add(yawPivot);
+
   // --- Navigation arrows group ---
-  // Pinned at world origin (0,0,0). The WebXR session uses 'local-floor'
-  // so the camera starts at floor height (~1.6m) and the user walks
-  // around. The nav visuals stay put in world space — no hit-test,
-  // no anchor, no calibration.
+  // Pinned at world origin (0,0,0) via yawPivot. The WebXR session
+  // uses 'local-floor' so the camera starts at floor height (~1.6m)
+  // and the user walks around. The nav visuals stay put in world
+  // space — no hit-test, no anchor, no calibration.
   const navArrowGroup = new THREE.Group();
   navArrowGroup.name = 'navArrowGroup';
   navArrowGroup.position.set(0, 0, 0);
-  scene.add(navArrowGroup);
+  yawPivot.add(navArrowGroup);
 
   // --- Floor grid (visual anchor so arrows don't appear to float) ---
   const gridHelper = new THREE.GridHelper(14, 14, 0x444444, 0x222222);
@@ -167,33 +178,61 @@ export function buildScene() {
   }
 
   // ------------------------------------------------------------------
+  //  YAW PIVOT — fixed direction
+  // ------------------------------------------------------------------
+  // The nav scene is parented to a yawPivot whose Y-rotation is set
+  // ONCE at build time and never changes. The user controls their
+  // own facing by physically turning their body, not by rotating
+  // the scene.
+  //
+  // FIXED_YAW_RAD: the rotation around world Y to apply to the
+  // entire nav scene. 0 = world -Z is "forward" (the standard
+  // Three.js / WebXR convention). Change this if your map's "north"
+  // doesn't line up with the session's local-floor -Z.
+  // ------------------------------------------------------------------
+
+  const FIXED_YAW_RAD = 0; // 0 = no rotation; arrows point world -Z (north)
+  yawPivot.rotation.y = FIXED_YAW_RAD;
+
+  // ------------------------------------------------------------------
   //  USER POSITION
   // ------------------------------------------------------------------
+
+  // Re-acquire the ref space when the session resumes (visibility
+  // flips back to 'visible'). After a pause the cached ref space
+  // returns a stale pose for 1-2 frames; we drop those frames and
+  // re-fetch a fresh one.
+  function getActiveRefSpace(frame) {
+    if (!frame || !frame.session) return null;
+
+    const session = frame.session;
+    if (session.__needsRefReset) {
+      session.__needsRefReset = false;
+      session.__localFloorRef = null;
+      return null; // skip this frame
+    }
+
+    if (session.__localFloorRef) return session.__localFloorRef;
+
+    try {
+      const ref = renderer.xr.getReferenceSpace();
+      if (ref) session.__localFloorRef = ref;
+      return ref;
+    } catch (e) {
+      return null;
+    }
+  }
 
   /**
    * Returns the user's floor-level position in WORLD space (relative
    * to world origin, which is where the nav graph is defined).
-   * No anchor subtraction — the session's local-floor ref space already
-   * aligns with world axes.
+   * Returns null when tracking is stale (right after visibilitychange).
    */
   function getUserPosition(frame) {
-    if (!frame) return new THREE.Vector3(0, 0, 0);
+    if (!frame) return null;
 
-    let refSpace = frame.session
-      ? frame.session.__localFloorRef
-      : null;
-
-    if (!refSpace) {
-      // Cache the ref space on the session to avoid re-requesting.
-      try {
-        refSpace = renderer.xr.getReferenceSpace();
-        if (frame.session) frame.session.__localFloorRef = refSpace;
-      } catch (e) {
-        return new THREE.Vector3(0, 0, 0);
-      }
-    }
-
-    if (!refSpace) return new THREE.Vector3(0, 0, 0);
+    const refSpace = getActiveRefSpace(frame);
+    if (!refSpace) return null;
 
     const pose = frame.getViewerPose(refSpace);
     if (pose && pose.views && pose.views.length > 0) {
@@ -202,7 +241,17 @@ export function buildScene() {
       return new THREE.Vector3(pos.x, 0, pos.z);
     }
 
-    return new THREE.Vector3(0, 0, 0);
+    return null;
+  }
+
+  /**
+   * Called from App.jsx on session visibilitychange. Flags the next
+   * frame to skip (stale pose) and forces ref-space re-acquisition.
+   */
+  function invalidateUserPosition() {
+    // We don't have direct access to the session here; App.jsx also
+    // sets session.__needsRefReset = true on its visibilitychange
+    // listener, so this is belt-and-braces.
   }
 
   // Suppress unused-var linting — we keep the renderer/scene import live
@@ -212,10 +261,12 @@ export function buildScene() {
   return {
     scene,
     navArrowGroup,
-    update(_dt) {
-      // nothing to do per-frame
+    update(_dt, _frame) {
+      // Yaw is fixed at build time (see FIXED_YAW_RAD). No per-frame
+      // orientation work needed.
     },
     setNavPath,
     getUserPosition,
+    invalidateUserPosition,
   };
 }

@@ -80,13 +80,8 @@ export default function Navigation() {
           <button className="nav-go-btn" disabled={destId === null} onClick={handleGo}>
             Go
           </button>
-          <button className="nav-cancel-btn" onClick={() => {
-            if (typeof window.__onCalibrate === 'function') window.__onCalibrate();
-          }}>
-            Set Origin
-          </button>
           <div style={{ fontSize: 11, opacity: 0.5, marginTop: 6, textAlign: 'center', lineHeight: 1.5 }}>
-            Stand at Lobby → Set Origin →<br />Select destination → Go → START AR
+            Select destination → Go → START AR
           </div>
         </>
       )}

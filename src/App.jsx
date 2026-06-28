@@ -126,6 +126,25 @@ export default function App() {
           xrSessionRef.current = session;
           if (xrButtonRef.current) xrButtonRef.current.setSession(session);
           session.addEventListener('end', onSessionEnded);
+
+          // --- Visibility change: when the user backgrounds the AR
+          //     view (notification, app switch, lock screen), the
+          //     browser pauses rAF. When they come back, the first
+          //     1-2 frames return a stale or zeroed viewer pose
+          //     until tracking re-converges, which makes the nav
+          //     arrow teleport and rotate. We drop those stale
+          //     frames and re-acquire the ref space on return. ---
+          session.addEventListener('visibilitychange', () => {
+            if (session.visibilityState === 'visible') {
+              // Flag the next frame in Scene.js to drop the stale
+              // pose and re-acquire the ref space.
+              session.__needsRefReset = true;
+              if (session.__localFloorRef) {
+                session.__localFloorRef = null;
+              }
+            }
+          });
+
           renderer.xr.setSession(session);
         })
         .catch((err) => {
@@ -148,7 +167,7 @@ export default function App() {
     //  Animation loop
     // ============================================================
     renderer.setAnimationLoop((_t, frame) => {
-      ctx.update(0);
+      ctx.update(0, frame);
 
       // --- Navigation update (when in AR and navigating) ---
       if (frame && window.__navState.navigating && !window.__navState.arrived) {
@@ -156,7 +175,7 @@ export default function App() {
         const path = window.__navState.path;
         const step = window.__navState.currentStep;
 
-        if (path && step < path.length) {
+        if (userPos && path && step < path.length) {
           const targetWp = getWaypoint(path[step]);
           if (targetWp) {
             const dx = userPos.x - targetWp.x;
