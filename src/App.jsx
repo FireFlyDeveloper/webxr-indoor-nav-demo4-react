@@ -36,7 +36,6 @@ export default function App() {
         distance: 0,
         arrived: false,
         navigating: false,
-        anchorPlaced: false,
       };
     }
 
@@ -54,18 +53,6 @@ export default function App() {
       }
       const waypointObjs = path.map((id) => getWaypoint(id)).filter(Boolean);
       ctx.setNavPath(waypointObjs);
-    };
-
-    // --- Calibration callback (called by Navigation.jsx's "Set Origin" button) ---
-    let pendingCalibrate = false;
-    window.__onCalibrate = () => { pendingCalibrate = true; };
-
-    // --- Anchor reset (un-pin so the user can re-tap) ---
-    window.__onAnchorReset = () => {
-      const ctx = sceneCtxRef.current;
-      if (!ctx) return;
-      ctx.clearAnchor();
-      if (window.__navState) window.__navState.anchorPlaced = false;
     };
 
     // Optional polyfill (default true), matching the original.
@@ -115,113 +102,30 @@ export default function App() {
     onResize();
 
     // ============================================================
-    //  WebXR Anchor + hit-test wiring
+    //  WebXR session — no hit-test, no XRAnchor
     // ============================================================
-    // Pattern follows the canonical three.js webxr_ar_hittest example
-    // (https://github.com/mrdoob/three.js/blob/r160/examples/webxr_ar_hittest.html)
-    // and the W3C WebXR Anchors Module
-    // (https://www.w3.org/TR/webxr-anchors-module/).
-    //
-    // Flow:
-    //  1. Request session with requiredFeatures: ['hit-test'] and
-    //     optionalFeatures: ['anchors', 'local-floor', 'dom-overlay'].
-    //  2. Once the session is started, request a hit-test source in
-    //     'viewer' reference space (the camera ray).
-    //  3. Per frame, get the latest hit-test result and use it to
-    //     position the reticle (visual feedback for the user).
-    //  4. On user 'select' (tap), call frame.createAnchor(pose, refSpace)
-    //     to create an XRAnchor at the hit-test pose. The anchor is
-    //     tracked by the WebXR runtime relative to the real world.
-    //  5. Per frame, getPose(xrAnchor.anchorSpace, refSpace) and apply
-    //     it to the navArrowGroup so the navigation visuals stay pinned
-    //     to the real-world location.
-    //
-    // three@0.160 does not export a THREE.XRAnchor class; we use the
-    // raw WebXR API. The anchor is stored in scene context.
+    // Scene is pinned at world origin (0,0,0). Request 'local-floor'
+    // so the camera's Y starts at floor height (~1.6m). No tap-to-place,
+    // no calibration step. Just walk and the nav arrows stay anchored
+    // in world space.
     // ============================================================
-
-    let hitTestSource = null;
-    let hitTestSourceRequested = false;
-    let sessionEndListenerAttached = false;
-    // The most recent XRFrame. Captured per animation frame and reused
-    // in the 'select' event handler so we don't need the non-standard
-    // XRSession.requestFrame() (which never made it into the spec).
-    let latestFrame = null;
 
     const onSessionEnded = () => {
-      if (ctx.skybox) ctx.skybox.visible = true;
       if (xrButtonRef.current) xrButtonRef.current.setSession(null);
       xrSessionRef.current = null;
-      hitTestSource = null;
-      hitTestSourceRequested = false;
-      sessionEndListenerAttached = false;
-      latestFrame = null;
-      ctx.clearAnchor();
-      if (window.__navState) window.__navState.anchorPlaced = false;
-    };
-
-    const onSelect = () => {
-      // The 'select' event is fired by the session on user tap. We
-      // use the most recent animation frame (which carries the latest
-      // hit-test results) to build the anchor pose.
-      if (!hitTestSource || !latestFrame) return;
-      if (ctx.hasAnchor()) return; // one anchor per session
-
-      const refSpace = renderer.xr.getReferenceSpace();
-      if (!refSpace) return;
-
-      const results = latestFrame.getHitTestResults(hitTestSource);
-      if (results.length === 0) return;
-      const pose = results[0].getPose(refSpace);
-      if (!pose) return;
-
-      // The hit-test result also has a convenience method that
-      // creates the anchor directly from its own pose. We prefer
-      // this when available because it preserves the precise
-      // hit-test semantics (e.g. plane-vs-mesh distinction).
-      let promise;
-      if (typeof results[0].createAnchor === 'function') {
-        promise = Promise.resolve(results[0].createAnchor());
-      } else {
-        promise = latestFrame.createAnchor(pose.transform, refSpace);
-      }
-
-      promise
-        .then((xrAnchor) => {
-          if (!xrAnchor) {
-            console.warn('createAnchor returned null; falling back to snapshot.');
-            pendingCalibrate = true;
-            return;
-          }
-          ctx.setAnchor(xrAnchor);
-          if (window.__navState) window.__navState.anchorPlaced = true;
-          console.log('XRAnchor created and pinned.');
-        })
-        .catch((err) => {
-          console.warn('createAnchor failed; using snapshot fallback:', err);
-          // Graceful fallback: the device supports hit-test but not
-          // anchors (e.g. some iOS builds). Use the legacy snapshot
-          // path so the demo still works.
-          pendingCalibrate = true;
-        });
     };
 
     const onRequestSession = () => {
       if (!navigator.xr) return;
       navigator.xr
         .requestSession('immersive-ar', {
-          requiredFeatures: ['hit-test'],
-          optionalFeatures: ['anchors', 'local-floor', 'dom-overlay'],
+          requiredFeatures: ['local-floor'],
+          optionalFeatures: ['dom-overlay'],
         })
         .then((session) => {
           xrSessionRef.current = session;
           if (xrButtonRef.current) xrButtonRef.current.setSession(session);
-          if (ctx.skybox) ctx.skybox.visible = false;
           session.addEventListener('end', onSessionEnded);
-          // Attach the select handler immediately, synchronously.
-          // This MUST happen inside the requestSession .then() so
-          // it runs before the user can possibly tap.
-          session.addEventListener('select', onSelect);
           renderer.xr.setSession(session);
         })
         .catch((err) => {
@@ -245,53 +149,6 @@ export default function App() {
     // ============================================================
     renderer.setAnimationLoop((_t, frame) => {
       ctx.update(0);
-      latestFrame = frame;
-
-      // --- Origin calibration (deferred to frame) — old snapshot path ---
-      if (pendingCalibrate && frame) {
-        ctx.calibrateOrigin(frame);
-        pendingCalibrate = false;
-      }
-
-      // --- Hit-test + Anchor pipeline (only when in AR) ---
-      if (frame) {
-        const referenceSpace = renderer.xr.getReferenceSpace();
-
-        // Lazy request the hit-test source the first time we have a frame.
-        if (!hitTestSourceRequested) {
-          const session = renderer.xr.getSession();
-          if (session && typeof session.requestHitTestSource === 'function') {
-            session
-              .requestReferenceSpace('viewer')
-              .then((viewerSpace) =>
-                session.requestHitTestSource({ space: viewerSpace })
-              )
-              .then((source) => {
-                hitTestSource = source;
-              })
-              .catch((err) => {
-                console.warn('requestHitTestSource failed:', err);
-              });
-          }
-          hitTestSourceRequested = true;
-        }
-
-        // Update reticle from latest hit-test result.
-        if (hitTestSource) {
-          const results = frame.getHitTestResults(hitTestSource);
-          if (results.length > 0) {
-            const hitPose = results[0].getPose(referenceSpace);
-            if (hitPose) {
-              ctx.setReticlePose(hitPose.transform.matrix);
-            }
-          } else {
-            ctx.setReticleVisible(false);
-          }
-        }
-
-        // Update the anchor (if one is pinned).
-        ctx.updateAnchor(frame, referenceSpace);
-      }
 
       // --- Navigation update (when in AR and navigating) ---
       if (frame && window.__navState.navigating && !window.__navState.arrived) {
@@ -340,8 +197,6 @@ export default function App() {
         renderer.domElement.parentNode.removeChild(renderer.domElement);
       }
       delete window.__onNavigate;
-      delete window.__onCalibrate;
-      delete window.__onAnchorReset;
     };
   }, []);
 
