@@ -345,23 +345,24 @@ export function buildScene() {
    * Per-frame: poll the anchor's current pose and apply it to the
    * anchorObject3D. This is how the WebXR runtime communicates the
    * SLAM-refined pose back to us.
+   *
+   * IMPORTANT: we update only the POSITION from the anchor's pose.
+   * The rotation is kept at identity (world-aligned) so that the
+   * navigation arrows point in real-world axes, not in whatever
+   * direction the camera was facing when the user tapped. Without
+   * this, the arrow orientation drifts as the camera was rotated at
+   * tap time and the nav graph (defined in world XZ) misaligns.
    */
   function updateAnchor(frame, refSpace) {
     if (!useAnchor || !activeAnchor || !frame || !refSpace) return;
     const pose = frame.getPose(activeAnchor.anchorSpace, refSpace);
     if (!pose) return;
-    anchorObject3D.matrix.fromArray(pose.transform.matrix);
-    anchorObject3D.matrix.decompose(
-      anchorObject3D.position,
-      anchorObject3D.quaternion,
-      anchorObject3D.scale
-    );
+    // Position only — preserve identity rotation.
+    const p = pose.transform.position;
+    anchorObject3D.position.set(p.x, p.y, p.z);
+    anchorObject3D.quaternion.identity();
     // Also keep the grid under the anchor for visual continuity.
-    gridHelper.position.set(
-      anchorObject3D.position.x,
-      0.005,
-      anchorObject3D.position.z
-    );
+    gridHelper.position.set(p.x, 0.005, p.z);
   }
 
   return {
